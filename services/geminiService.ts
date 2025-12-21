@@ -1,3 +1,4 @@
+
 import { GoogleGenAI, Type, Modality } from "@google/genai";
 import { Song, SongSectionType, SongGenre } from "../types";
 import { getAudioContext } from "./audioEngine";
@@ -6,37 +7,36 @@ const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
 // --- Text Generation (Lyrics & Chords) ---
 
-export const generateSong = async (theme: string, mood: string, genre: SongGenre): Promise<Song> => {
-  const model = "gemini-2.5-flash";
+export const generateSong = async (
+  promptOrLyrics: string, 
+  styles: string, 
+  genre: SongGenre,
+  useProvidedLyrics: boolean = false
+): Promise<Song> => {
+  const model = "gemini-3-pro-preview";
 
-  let genreInstruction = "";
-  if (genre === 'rnb') {
-    genreInstruction = "Style: Soulful R&B similar to 'Hate To Let You Go'. Use rich chords (maj7, m9, dim7, 11). Tempo around 80-90 BPM.";
-  } else if (genre === 'pop') {
-    genreInstruction = "Style: Modern Pop. Catchy, repetitive, upbeat. Use simple, effective triad chords (I-V-vi-IV progressions). Tempo around 110-128 BPM. Lyrics should be conversational and hooky.";
-  } else if (genre === 'country') {
-    genreInstruction = "Style: Country Folk. Acoustic, warm, storytelling. Use standard open chords (G, C, D, Em, Am). Tempo around 70-100 BPM. Lyrics should focus on imagery, home, nature, or heartbreak.";
-  } else if (genre === 'chinese') {
-    genreInstruction = "Style: Chinese Traditional/Gufeng (Ancient Style). Poetic, elegant, using imagery of nature, moonlight, and longing. Use chords that imply pentatonic scales (add9, sus2, maj7, min7). Tempo around 60-80 BPM.";
-  }
-
-  const prompt = `Create a song. 
-  ${genreInstruction}
-  Topic: ${theme}.
-  Mood: ${mood}.
+  const systemInstruction = `You are a world-class music producer. 
+  Output ONLY valid JSON. Do not include image data or base64.
+  Style Direction: ${styles}
+  Primary Genre: ${genre}
   
-  Provide a creative title, tempo, musical key, and a short description.
-  Break down the song into sections (Verse, Chorus, Bridge, etc.).
-  For each section, provide lines of lyrics and the chords that go with them.
-  Ensure chords are placed correctly for the lines.
-  
-  Output must be JSON matching the schema.
+  Musical Guidelines:
+  - If R&B: Use complex chords (maj9, m11).
+  - If Pop: Simple catchy progressions.
+  - If Chinese Style: Pentatonic movements.
+  - Keep the description short (max 20 words).
   `;
+
+  const userPrompt = useProvidedLyrics 
+    ? `Compose the structure and chords for these lyrics: "${promptOrLyrics}". Style: ${styles}.`
+    : `Write a ${genre} song about: ${promptOrLyrics}. Musical Style: ${styles}.`;
 
   const response = await ai.models.generateContent({
     model,
-    contents: prompt,
+    contents: userPrompt,
     config: {
+      systemInstruction,
+      thinkingConfig: { thinkingBudget: 4000 },
       responseMimeType: "application/json",
       responseSchema: {
         type: Type.OBJECT,
@@ -49,7 +49,6 @@ export const generateSong = async (theme: string, mood: string, genre: SongGenre
               tempo: { type: Type.STRING },
               key: { type: Type.STRING },
               description: { type: Type.STRING },
-              genre: { type: Type.STRING, enum: ['rnb', 'pop', 'country', 'chinese'] },
               sections: {
                 type: Type.ARRAY,
                 items: {
@@ -68,127 +67,94 @@ export const generateSong = async (theme: string, mood: string, genre: SongGenre
     },
   });
 
-  const json = JSON.parse(response.text || "{}");
-  // Enforce genre if model missed it, or just pass it through
-  json.song.genre = genre;
-  return json.song;
+  const text = response.text || "{}";
+  try {
+    const json = JSON.parse(text);
+    if (!json.song) throw new Error("Missing song data");
+    
+    // Defensive check for sections and lyrics
+    if (!json.song.sections || !Array.isArray(json.song.sections)) {
+      json.song.sections = [];
+    } else {
+      json.song.sections = json.song.sections.map((s: any) => ({
+        ...s,
+        lyrics: Array.isArray(s.lyrics) ? s.lyrics : [],
+        chords: Array.isArray(s.chords) ? s.chords : []
+      }));
+    }
+
+    json.song.genre = genre;
+    return json.song;
+  } catch (e) {
+    console.error("Raw AI Response:", text);
+    throw new Error("The AI returned an invalid music structure. Please try again.");
+  }
+};
+
+export const expandLyrics = async (initialPrompt: string): Promise<string> => {
+    const response = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: `Expand this song idea into professional lyrics (2 verses, 1 chorus): ${initialPrompt}`
+    });
+    return response.text || "";
 };
 
 // --- Image Generation (Album Art) ---
 
 export const generateAlbumArt = async (title: string, description: string, genre: string): Promise<string | undefined> => {
   try {
-    const prompt = `Album cover art for a ${genre} song titled "${title}". 
-    Description: ${description}. 
-    High quality, artistic, 4k, digital art, atmospheric lighting. 
-    ${genre === 'chinese' ? 'Ink wash painting style, elegant, nature' : ''}
-    ${genre === 'rnb' ? 'Neon lights, moody, soulful, dark background' : ''}
-    ${genre === 'pop' ? 'Vibrant, colorful, abstract geometric shapes' : ''}
-    ${genre === 'country' ? 'Vintage texture, acoustic guitar, sunset, fields' : ''}
-    `;
-
+    const prompt = `Album cover: "${title}". Style: ${genre}. Vibe: ${description}. Digital art, high quality.`;
     const response = await ai.models.generateContent({
       model: 'gemini-2.5-flash-image',
-      contents: {
-        parts: [{ text: prompt }],
-      },
-      config: {
-        imageConfig: {
-          aspectRatio: "1:1",
-        },
-      },
+      contents: { parts: [{ text: prompt }] },
+      config: { imageConfig: { aspectRatio: "1:1" } },
     });
-
     for (const part of response.candidates?.[0]?.content?.parts || []) {
-      if (part.inlineData) {
-        return `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
-      }
+      if (part.inlineData) return `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
     }
     return undefined;
   } catch (error) {
-    console.error("Album art generation failed:", error);
-    return undefined; // Fail gracefully
+    return undefined;
   }
 };
 
 // --- TTS Audio Generation ---
 
-// Helper to decode Base64
 function decode(base64: string) {
   const binaryString = atob(base64);
-  const len = binaryString.length;
-  const bytes = new Uint8Array(len);
-  for (let i = 0; i < len; i++) {
-    bytes[i] = binaryString.charCodeAt(i);
-  }
+  const bytes = new Uint8Array(binaryString.length);
+  for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
   return bytes;
 }
 
-// Helper to decode Audio Data
-async function decodeAudioData(
-  data: Uint8Array,
-  ctx: AudioContext,
-  sampleRate: number,
-  numChannels: number,
-): Promise<AudioBuffer> {
+async function decodeAudioData(data: Uint8Array, ctx: AudioContext, sampleRate: number, numChannels: number): Promise<AudioBuffer> {
   const dataInt16 = new Int16Array(data.buffer);
   const frameCount = dataInt16.length / numChannels;
   const buffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
-
   for (let channel = 0; channel < numChannels; channel++) {
     const channelData = buffer.getChannelData(channel);
-    for (let i = 0; i < frameCount; i++) {
-      channelData[i] = dataInt16[i * numChannels + channel] / 32768.0;
-    }
+    for (let i = 0; i < frameCount; i++) channelData[i] = dataInt16[i * numChannels + channel] / 32768.0;
   }
   return buffer;
 }
 
 export const generateTTSAudio = async (text: string, genre: SongGenre): Promise<AudioBuffer> => {
   const model = "gemini-2.5-flash-preview-tts";
-  
-  let instruction = "";
   let voiceName = "Kore";
-
-  if (genre === 'rnb') {
-    instruction = "Perform these lyrics as a soulful R&B spoken word, emotional and smooth. Use pauses for effect.";
-    voiceName = "Kore";
-  } else if (genre === 'pop') {
-    instruction = "Perform these lyrics with an upbeat, energetic pop delivery. Speak clearly and rhythmically.";
-    voiceName = "Fenrir"; 
-  } else if (genre === 'country') {
-    instruction = "Perform these lyrics with a warm, storytelling folk style. Calm and sincere.";
-    voiceName = "Zephyr"; 
-  } else if (genre === 'chinese') {
-    instruction = "Perform these lyrics with a gentle, poetic, and slightly dramatic recitation style.";
-    voiceName = "Puck"; 
-  }
+  if (genre === 'pop') voiceName = "Fenrir";
+  else if (genre === 'country') voiceName = "Zephyr";
+  else if (genre === 'chinese') voiceName = "Puck";
 
   const response = await ai.models.generateContent({
     model,
-    contents: [{ parts: [{ text: `${instruction} Lyrics: ${text}` }] }],
+    contents: [{ parts: [{ text: `Sing smoothly: \n${text}` }] }],
     config: {
       responseModalities: [Modality.AUDIO],
-      speechConfig: {
-        voiceConfig: {
-          prebuiltVoiceConfig: { voiceName },
-        },
-      },
+      speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName } } },
     },
   });
 
-  const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-
-  if (!base64Audio) {
-    throw new Error("No audio data returned");
-  }
-
-  const audioCtx = getAudioContext();
-  
-  return await decodeAudioData(
-    decode(base64Audio),
-    audioCtx,
-    24000,
-    1,
-  );
+  const base64Audio = response.candidates?.[0]?.content?.parts.find(p => p.inlineData)?.inlineData?.data;
+  if (!base64Audio) throw new Error("Playback Error: No audio data returned");
+  return await decodeAudioData(decode(base64Audio), getAudioContext(), 24000, 1);
 };

@@ -1,6 +1,6 @@
+
 import { Song, SongGenre, SongSectionType } from '../types';
 
-// Frequency map for notes
 const NOTES: Record<string, number> = {
   'Cb': 246.94, 'C': 261.63, 'C#': 277.18, 'Db': 277.18,
   'D': 293.66, 'D#': 311.13, 'Eb': 311.13,
@@ -11,491 +11,230 @@ const NOTES: Record<string, number> = {
   'B': 493.88, 'B#': 523.25
 };
 
-// Chord qualities (semitones from root)
 const CHORD_SHAPES: Record<string, number[]> = {
-  'maj': [0, 4, 7],
-  'min': [0, 3, 7],
-  'm': [0, 3, 7],
-  'dim': [0, 3, 6],
-  'aug': [0, 4, 8],
-  '7': [0, 4, 7, 10],
-  'maj7': [0, 4, 7, 11],
-  'm7': [0, 3, 7, 10],
-  '9': [0, 4, 7, 10, 14],
-  'maj9': [0, 4, 7, 11, 14],
-  'm9': [0, 3, 7, 10, 14],
-  'sus4': [0, 5, 7],
-  'sus2': [0, 2, 7],
-  'add9': [0, 4, 7, 14],
+  'maj': [0, 4, 7], 'min': [0, 3, 7], 'm': [0, 3, 7], 'dim': [0, 3, 6],
+  '7': [0, 4, 7, 10], 'maj7': [0, 4, 7, 11], 'm7': [0, 3, 7, 10],
+  '9': [0, 4, 7, 10, 14], 'add9': [0, 4, 7, 14], 'sus4': [0, 5, 7], 'sus2': [0, 2, 7]
 };
 
 let audioCtx: AudioContext | null = null;
 let masterGain: GainNode | null = null;
 let masterCompressor: DynamicsCompressorNode | null = null;
-let musicBus: GainNode | null = null; // Bus for sidechaining
+let musicBus: GainNode | null = null; 
 let reverbNode: ConvolverNode | null = null;
 let activeNodes: AudioNode[] = [];
 let noiseBuffer: AudioBuffer | null = null;
 
 export const getAudioContext = () => {
-  if (!audioCtx) {
-    audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
-  }
+  if (!audioCtx) audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
   return audioCtx;
 };
 
-// --- REVERB & EFFECTS ---
-
-const createImpulseResponse = (ctx: AudioContext, duration: number, decay: number) => {
+const createImpulseResponse = (ctx: BaseAudioContext, duration: number, decay: number) => {
     const rate = ctx.sampleRate;
     const length = rate * duration;
     const impulse = ctx.createBuffer(2, length, rate);
     const left = impulse.getChannelData(0);
     const right = impulse.getChannelData(1);
-
     for (let i = 0; i < length; i++) {
         const n = i / length;
-        // Pink noise with exponential decay, smoothed
         const noise = (Math.random() * 2 - 1) * Math.pow(1 - n, decay);
-        left[i] = noise;
-        right[i] = noise;
+        left[i] = noise; right[i] = noise;
     }
     return impulse;
 };
 
-const setupMasterBus = (ctx: AudioContext) => {
-    if (masterGain && reverbNode && masterCompressor && musicBus) return { masterGain, reverbNode, masterCompressor, musicBus };
+// Helper for both real-time and offline routing
+const setupRouting = (ctx: BaseAudioContext) => {
+    const compressor = ctx.createDynamicsCompressor();
+    compressor.threshold.value = -16;
+    compressor.knee.value = 30;
+    compressor.ratio.value = 10;
+    compressor.attack.value = 0.003;
+    compressor.release.value = 0.25;
 
-    // 1. Dynamics Compressor (Limit/Glue)
-    masterCompressor = ctx.createDynamicsCompressor();
-    masterCompressor.threshold.value = -18;
-    masterCompressor.knee.value = 30;
-    masterCompressor.ratio.value = 12;
-    masterCompressor.attack.value = 0.003;
-    masterCompressor.release.value = 0.25;
-
-    // 2. Master EQ (Smile Curve for "Produced" Sound)
     const lowShelf = ctx.createBiquadFilter();
     lowShelf.type = "lowshelf";
-    lowShelf.frequency.value = 80;
-    lowShelf.gain.value = 4; // Boost bass
+    lowShelf.frequency.value = 100;
+    lowShelf.gain.value = 3;
 
     const highShelf = ctx.createBiquadFilter();
     highShelf.type = "highshelf";
-    highShelf.frequency.value = 8000;
-    highShelf.gain.value = 4; // Boost treble (air)
+    highShelf.frequency.value = 10000;
+    highShelf.gain.value = 2;
 
-    // 3. Music Bus (Sidechain Target)
-    musicBus = ctx.createGain();
+    const mBus = ctx.createGain();
+    const mGain = ctx.createGain();
+    mGain.gain.value = 0.85;
     
-    // 4. Master Gain
-    masterGain = ctx.createGain();
-    masterGain.gain.value = 0.8;
-    
-    // 5. Large Hall Reverb
-    reverbNode = ctx.createConvolver();
-    reverbNode.buffer = createImpulseResponse(ctx, 4.5, 3.0); // Huge decay
+    const rNode = ctx.createConvolver();
+    rNode.buffer = createImpulseResponse(ctx, 4.0, 3.5);
     const reverbWet = ctx.createGain();
-    reverbWet.gain.value = 0.5; // Very wet mix
+    reverbWet.gain.value = 0.45;
 
-    // Routing:
-    // Instruments -> MusicBus
-    // Reverb -> MusicBus
-    // MusicBus -> LowShelf -> HighShelf -> MasterCompressor -> MasterGain -> Out
-    
-    musicBus.connect(lowShelf);
+    mBus.connect(lowShelf);
     lowShelf.connect(highShelf);
-    highShelf.connect(masterCompressor);
+    highShelf.connect(compressor);
+    rNode.connect(reverbWet);
+    reverbWet.connect(mBus);
+    compressor.connect(mGain);
+    mGain.connect(ctx.destination);
 
-    reverbNode.connect(reverbWet);
-    reverbWet.connect(musicBus); // Reverb gets sidechained too!
-
-    masterCompressor.connect(masterGain);
-    masterGain.connect(ctx.destination);
-
-    return { masterGain, reverbNode, masterCompressor, musicBus };
+    return { masterGain: mGain, reverbNode: rNode, masterCompressor: compressor, musicBus: mBus };
 };
 
-const triggerSidechain = (ctx: AudioContext, time: number) => {
-    if (!musicBus) return;
-    // Duck the volume of the music bus when kick hits
-    musicBus.gain.setValueAtTime(1, time);
-    musicBus.gain.setTargetAtTime(0.4, time, 0.01); // Fast attack
-    musicBus.gain.setTargetAtTime(1, time + 0.1, 0.1); // Release
+const triggerSidechain = (musicBus: GainNode, time: number) => {
+    musicBus.gain.setTargetAtTime(0.5, time, 0.01);
+    musicBus.gain.setTargetAtTime(1, time + 0.1, 0.1);
 };
 
-// --- DRUMS & PERCUSSION ---
+const playKick = (ctx: BaseAudioContext, time: number, vol = 1.0, dest: AudioNode, musicBus?: GainNode) => {
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.frequency.setValueAtTime(150, time);
+    osc.frequency.exponentialRampToValueAtTime(0.01, time + 0.4);
+    gain.gain.setValueAtTime(vol, time);
+    gain.gain.exponentialRampToValueAtTime(0.001, time + 0.4);
+    osc.connect(gain);
+    gain.connect(dest);
+    osc.start(time);
+    osc.stop(time + 0.4);
+    if (musicBus) triggerSidechain(musicBus, time);
+    return osc;
+};
 
-const createNoiseBuffer = (ctx: AudioContext) => {
-    if (noiseBuffer) return noiseBuffer;
+const playSnare = (ctx: BaseAudioContext, time: number, vol = 0.8, dest: AudioNode, nBuffer: AudioBuffer) => {
+    const noise = ctx.createBufferSource();
+    noise.buffer = nBuffer;
+    const noiseFilter = ctx.createBiquadFilter();
+    noiseFilter.type = "highpass";
+    noiseFilter.frequency.value = 1200;
+    const noiseGain = ctx.createGain();
+    noiseGain.gain.setValueAtTime(vol, time);
+    noiseGain.gain.exponentialRampToValueAtTime(0.01, time + 0.25);
+    noise.connect(noiseFilter).connect(noiseGain).connect(dest);
+    noise.start(time);
+    noise.stop(time + 0.25);
+    return noise;
+};
+
+const createNoiseBuffer = (ctx: BaseAudioContext) => {
     const bufferSize = ctx.sampleRate * 2;
     const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
     const data = buffer.getChannelData(0);
-    for (let i = 0; i < bufferSize; i++) {
-        data[i] = Math.random() * 2 - 1;
-    }
-    noiseBuffer = buffer;
+    for (let i = 0; i < bufferSize; i++) data[i] = Math.random() * 2 - 1;
     return buffer;
 };
 
-const playKick = (ctx: AudioContext, time: number, vol = 1.0, dest: AudioNode) => {
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    
-    osc.frequency.setValueAtTime(150, time);
-    osc.frequency.exponentialRampToValueAtTime(0.01, time + 0.4);
-    
-    gain.gain.setValueAtTime(vol, time);
-    gain.gain.exponentialRampToValueAtTime(0.001, time + 0.4);
-    
-    osc.connect(gain);
-    gain.connect(dest); // Kick goes to Master (not Sidechained bus)
-    
-    osc.start(time);
-    osc.stop(time + 0.4);
-    activeNodes.push(osc, gain);
-
-    // Trigger Sidechain on Music Bus
-    triggerSidechain(ctx, time);
-};
-
-const playSnare = (ctx: AudioContext, time: number, vol = 0.8, dest: AudioNode) => {
-    // Noise
-    const noise = ctx.createBufferSource();
-    noise.buffer = createNoiseBuffer(ctx);
-    const noiseFilter = ctx.createBiquadFilter();
-    noiseFilter.type = "highpass";
-    noiseFilter.frequency.value = 1500;
-    const noiseGain = ctx.createGain();
-    noiseGain.gain.setValueAtTime(vol, time);
-    noiseGain.gain.exponentialRampToValueAtTime(0.01, time + 0.3);
-    
-    noise.connect(noiseFilter).connect(noiseGain).connect(dest);
-    noise.start(time);
-    noise.stop(time + 0.3);
-    
-    // Body
-    const osc = ctx.createOscillator();
-    osc.type = "triangle";
-    osc.frequency.setValueAtTime(200, time);
-    osc.frequency.exponentialRampToValueAtTime(100, time + 0.1);
-    const oscGain = ctx.createGain();
-    oscGain.gain.setValueAtTime(vol * 0.5, time);
-    oscGain.gain.exponentialRampToValueAtTime(0.01, time + 0.15);
-    
-    osc.connect(oscGain).connect(dest);
-    osc.start(time);
-    osc.stop(time + 0.15);
-
-    activeNodes.push(noise, noiseGain, osc, oscGain);
-};
-
-const playHiHat = (ctx: AudioContext, time: number, vol = 0.6, dest: AudioNode, panVal = 0.3, open = false) => {
+const playHiHat = (ctx: BaseAudioContext, time: number, vol = 0.6, dest: AudioNode, nBuffer: AudioBuffer) => {
     const source = ctx.createBufferSource();
-    source.buffer = createNoiseBuffer(ctx);
-    
+    source.buffer = nBuffer;
     const filter = ctx.createBiquadFilter();
     filter.type = "highpass";
-    filter.frequency.value = 8000;
-    
+    filter.frequency.value = 9000;
     const gain = ctx.createGain();
-    const duration = open ? 0.3 : 0.05;
-    gain.gain.setValueAtTime(vol * 0.5, time);
-    gain.gain.exponentialRampToValueAtTime(0.01, time + duration);
-    
-    const panner = ctx.createStereoPanner();
-    panner.pan.value = panVal;
-
-    source.connect(filter).connect(gain).connect(panner).connect(dest);
-    
+    gain.gain.setValueAtTime(vol * 0.3, time);
+    gain.gain.exponentialRampToValueAtTime(0.01, time + 0.05);
+    source.connect(filter).connect(gain).connect(dest);
     source.start(time);
-    source.stop(time + duration);
-    activeNodes.push(source, gain, panner);
+    source.stop(time + 0.05);
+    return source;
 };
 
-const playCrash = (ctx: AudioContext, time: number, dest: AudioNode) => {
-    const source = ctx.createBufferSource();
-    source.buffer = createNoiseBuffer(ctx);
-    const filter = ctx.createBiquadFilter();
-    filter.type = "highpass";
-    filter.frequency.value = 4000;
-    const gain = ctx.createGain();
-    gain.gain.setValueAtTime(0.6, time);
-    gain.gain.exponentialRampToValueAtTime(0.01, time + 3.0); // Long decay
-    
-    const panner = ctx.createStereoPanner();
-    panner.pan.value = 0; // Center
-
-    source.connect(filter).connect(gain).connect(panner).connect(dest);
-    source.start(time);
-    source.stop(time + 3.0);
-    activeNodes.push(source, gain, panner);
-};
-
-const playWoodblock = (ctx: AudioContext, time: number, dest: AudioNode) => {
+const playNote = (ctx: BaseAudioContext, freq: number, time: number, duration: number, type: string, dest: AudioNode, vol = 0.1) => {
     const osc = ctx.createOscillator();
-    osc.frequency.setValueAtTime(800, time);
+    osc.type = type === 'bass' ? 'square' : (type === 'lead' ? 'sawtooth' : 'triangle');
+    osc.frequency.value = freq;
     const gain = ctx.createGain();
-    gain.gain.setValueAtTime(0.7, time);
-    gain.gain.exponentialRampToValueAtTime(0.01, time + 0.1);
-    
+    gain.gain.setValueAtTime(0, time);
+    gain.gain.linearRampToValueAtTime(vol, time + 0.05);
+    gain.gain.exponentialRampToValueAtTime(0.001, time + duration);
     osc.connect(gain).connect(dest);
     osc.start(time);
-    osc.stop(time + 0.1);
-    activeNodes.push(osc, gain);
-}
-
-// --- SYNTHS & INSTRUMENTS ---
-
-export const stopAudio = () => {
-  activeNodes.forEach(node => {
-    try {
-      if (node instanceof AudioBufferSourceNode) node.stop();
-      if (node instanceof OscillatorNode) node.stop();
-      node.disconnect();
-    } catch (e) { }
-  });
-  activeNodes = [];
+    osc.stop(time + duration);
+    return osc;
 };
 
 const getChordFrequencies = (chordName: string): number[] => {
   const rootMatch = chordName.match(/^([A-G][#b]?)(.*)$/);
   if (!rootMatch) return [];
-
   const rootNote = rootMatch[1];
   const quality = rootMatch[2] || 'maj';
   const baseFreq = NOTES[rootNote];
   if (!baseFreq) return [];
-
   let intervals = CHORD_SHAPES['maj']; 
-  const qualityKeys = Object.keys(CHORD_SHAPES).sort((a, b) => b.length - a.length);
-  for (const key of qualityKeys) {
-    if (quality === key || quality.startsWith(key)) {
-        intervals = CHORD_SHAPES[key];
-        break;
-    }
+  for (const key of Object.keys(CHORD_SHAPES).sort((a, b) => b.length - a.length)) {
+    if (quality.startsWith(key)) { intervals = CHORD_SHAPES[key]; break; }
   }
-  if (quality === 'm' || quality === 'min') intervals = CHORD_SHAPES['m'];
-
   return intervals.map(semitones => baseFreq * Math.pow(2, semitones / 12));
 };
 
-interface InstrumentConfig {
-  type: 'synth' | 'epiano' | 'guitar' | 'piano' | 'guzheng' | 'pad' | 'bass' | 'lead';
-  oscillatorType: OscillatorType;
-  attack: number;
-  decay: number;
-  sustainLevel: number;
-  release: number;
-  strumDelay: number;
-}
+// Common rendering logic for real-time and offline
+const renderMusicToContext = (ctx: BaseAudioContext, song: Song, vocalBuffer: AudioBuffer | null, musicBus: GainNode, masterCompressor: DynamicsCompressorNode, reverbNode: ConvolverNode, startTime: number) => {
+  let cursor = startTime;
+  const bpm = parseInt(song.tempo) || 90;
+  const barDur = (60/bpm) * 4;
+  const nBuffer = createNoiseBuffer(ctx);
+  const nodes: AudioNode[] = [];
 
-const INSTRUMENTS: Record<string, InstrumentConfig> = {
-  epiano: { type: 'epiano', oscillatorType: 'sine', attack: 0.02, decay: 0.5, sustainLevel: 0.2, release: 0.5, strumDelay: 0.01 },
-  synth: { type: 'synth', oscillatorType: 'sawtooth', attack: 0.05, decay: 0.2, sustainLevel: 0.4, release: 0.3, strumDelay: 0 },
-  guitar: { type: 'guitar', oscillatorType: 'triangle', attack: 0.01, decay: 0.3, sustainLevel: 0.1, release: 0.3, strumDelay: 0.04 },
-  piano: { type: 'piano', oscillatorType: 'sine', attack: 0.01, decay: 0.8, sustainLevel: 0.1, release: 0.8, strumDelay: 0.005 },
-  guzheng: { type: 'guzheng', oscillatorType: 'triangle', attack: 0.005, decay: 1.5, sustainLevel: 0, release: 1.5, strumDelay: 0.05 },
-  pad: { type: 'pad', oscillatorType: 'sawtooth', attack: 0.5, decay: 1.0, sustainLevel: 0.8, release: 2.0, strumDelay: 0 },
-  bass: { type: 'bass', oscillatorType: 'square', attack: 0.02, decay: 0.2, sustainLevel: 0.8, release: 0.2, strumDelay: 0 },
-  lead: { type: 'lead', oscillatorType: 'triangle', attack: 0.05, decay: 0.1, sustainLevel: 0.5, release: 0.1, strumDelay: 0 },
-};
+  if (vocalBuffer) {
+    const vocalMainGain = ctx.createGain();
+    vocalMainGain.gain.value = 1.1;
+    const presenceEQ = ctx.createBiquadFilter();
+    presenceEQ.type = "peaking";
+    presenceEQ.frequency.value = 4000;
+    presenceEQ.gain.value = 5;
+    const highCut = ctx.createBiquadFilter();
+    highCut.type = "lowpass";
+    highCut.frequency.value = 12000;
+    const lowCut = ctx.createBiquadFilter();
+    lowCut.type = "highpass";
+    lowCut.frequency.value = 150;
+    const vocalComp = ctx.createDynamicsCompressor();
+    vocalComp.threshold.value = -20;
+    vocalComp.ratio.value = 4;
 
-const playNote = (
-    ctx: AudioContext, 
-    freq: number, 
-    time: number, 
-    duration: number, 
-    config: InstrumentConfig, 
-    dest: AudioNode,
-    pan: number = 0,
-    vol: number = 0.1
-) => {
-    const panner = ctx.createStereoPanner();
-    panner.pan.value = pan;
-    panner.connect(dest);
+    const vocalSource = ctx.createBufferSource();
+    vocalSource.buffer = vocalBuffer;
+    vocalSource.connect(lowCut);
+    lowCut.connect(highCut);
+    highCut.connect(presenceEQ);
+    presenceEQ.connect(vocalComp);
+    vocalComp.connect(vocalMainGain);
+    vocalMainGain.connect(masterCompressor);
 
-    const noteGain = ctx.createGain();
-    noteGain.connect(panner);
-    noteGain.gain.setValueAtTime(vol, time); 
+    const leftDelay = ctx.createDelay(); leftDelay.delayTime.value = 0.025;
+    const rightDelay = ctx.createDelay(); rightDelay.delayTime.value = 0.035;
+    const panL = ctx.createStereoPanner(); panL.pan.value = -0.6;
+    const panR = ctx.createStereoPanner(); panR.pan.value = 0.6;
+    const sideGain = ctx.createGain(); sideGain.gain.value = 0.4;
 
-    const envGain = ctx.createGain();
-    envGain.connect(noteGain);
-    envGain.gain.setValueAtTime(0, time);
-    envGain.gain.linearRampToValueAtTime(1, time + config.attack);
-    envGain.gain.exponentialRampToValueAtTime(Math.max(0.001, config.sustainLevel), time + config.attack + config.decay);
-    envGain.gain.linearRampToValueAtTime(0, time + duration + config.release);
+    vocalMainGain.connect(leftDelay).connect(panL).connect(sideGain).connect(reverbNode);
+    vocalMainGain.connect(rightDelay).connect(panR).connect(sideGain).connect(reverbNode);
 
-    const osc = ctx.createOscillator();
-    osc.type = config.oscillatorType;
-    osc.frequency.value = freq;
-    
-    // Low pass filter
-    const filter = ctx.createBiquadFilter();
-    filter.type = "lowpass";
-    filter.frequency.setValueAtTime(config.type === 'bass' ? 600 : 4000, time);
-    if(config.type === 'lead') filter.frequency.value = 8000;
-    
-    osc.connect(filter).connect(envGain);
-    
-    // Layering for richness
-    if (['piano', 'epiano', 'pad', 'guitar'].includes(config.type)) {
-        const osc2 = ctx.createOscillator();
-        osc2.type = config.type === 'guitar' ? 'sawtooth' : config.oscillatorType; 
-        osc2.frequency.value = freq;
-        osc2.detune.value = config.type === 'pad' ? 12 : 5; // Detune for chorus effect
-        const osc2Gain = ctx.createGain();
-        osc2Gain.gain.value = 0.4;
-        osc2.connect(osc2Gain).connect(filter);
-        osc2.start(time);
-        osc2.stop(time + duration + config.release);
-        activeNodes.push(osc2, osc2Gain);
-    }
-    
-    if (config.type === 'bass') {
-        // Sub oscillator
-        const subOsc = ctx.createOscillator();
-        subOsc.type = 'sine';
-        subOsc.frequency.value = freq / 2;
-        const subGain = ctx.createGain();
-        subGain.gain.value = 1.2; // Loud sub
-        subOsc.connect(subGain).connect(envGain);
-        subOsc.start(time);
-        subOsc.stop(time + duration + config.release);
-        activeNodes.push(subOsc, subGain);
-    }
+    vocalSource.start(startTime);
+    nodes.push(vocalSource);
+  }
 
-    osc.start(time);
-    osc.stop(time + duration + config.release);
-    activeNodes.push(osc, envGain, noteGain, panner, filter);
-};
-
-// --- ARRANGEMENT ENGINE ---
-
-const playArrangement = (
-    ctx: AudioContext, 
-    genre: SongGenre, 
-    frequencies: number[], 
-    startTime: number, 
-    duration: number,
-    bpm: number,
-    musicBus: AudioNode,
-    masterBus: AudioNode, // For drums
-    reverb: AudioNode,
-    sectionType: SongSectionType
-) => {
-    const beatsInBar = 4;
-    const beatDuration = 60 / bpm;
-    const barDuration = beatDuration * beatsInBar;
-    
-    let currentTime = startTime;
-    const endTime = startTime + duration;
-
-    // Instruments
-    let instConfig = INSTRUMENTS['epiano'];
-    let bassConfig = INSTRUMENTS['bass'];
-    let padConfig = INSTRUMENTS['pad'];
-    let leadConfig = INSTRUMENTS['lead'];
-
-    if (genre === 'pop') instConfig = INSTRUMENTS['synth'];
-    if (genre === 'country') instConfig = INSTRUMENTS['guitar'];
-    if (genre === 'chinese') instConfig = INSTRUMENTS['guzheng'];
-
-    const rootFreq = frequencies[0] / 2;
-    const isChorus = sectionType === SongSectionType.CHORUS;
-    const isBridge = sectionType === SongSectionType.BRIDGE;
-    const isVerse = sectionType === SongSectionType.VERSE;
-
-    // Intensity Multiplier
-    const volMult = isChorus ? 1.0 : (isBridge ? 0.9 : 0.7);
-
-    // Initial Crash for Chorus
-    if (isChorus && Math.abs(currentTime - startTime) < 0.1) {
-        playCrash(ctx, currentTime, musicBus); // Send crash to reverb/music bus
-    }
-
-    while (currentTime < endTime - 0.1) {
-        // --- DRUMS (Send to MasterBus or MusicBus depending on sidechain needs) ---
-        // We trigger sidechain INSIDE playKick, so Kick goes to MasterBus.
-        // Snare/Hats go to MasterBus usually, or MusicBus if we want them ducked. Let's send to MasterBus for clarity.
-        
-        if (genre === 'pop') {
-            // Beat
-            playKick(ctx, currentTime, 1.0, masterBus);
-            playSnare(ctx, currentTime + beatDuration, 0.9 * volMult, masterBus);
-            playKick(ctx, currentTime + beatDuration * 2, 1.0, masterBus);
-            playSnare(ctx, currentTime + beatDuration * 3, 0.9 * volMult, masterBus);
-            
-            // 16th Note Hi-Hats for Chorus
-            const hatDiv = isChorus ? 4 : 2; 
-            for(let i=0; i< (beatsInBar * hatDiv); i++) {
-                const hatTime = currentTime + (beatDuration / hatDiv) * i;
-                const isOffBeat = i % 2 !== 0;
-                playHiHat(ctx, hatTime, (isOffBeat ? 0.3 : 0.5) * volMult, masterBus, (i%2===0 ? -0.2 : 0.2), isChorus && i % 4 === 2);
+  song.sections.forEach(section => {
+    section.chords.forEach(chordLine => {
+        const chords = chordLine.split(/\s+/).filter(x => x.length > 0);
+        const dur = barDur / (chords.length || 1);
+        chords.forEach(c => {
+            const freqs = getChordFrequencies(c);
+            if (freqs.length) {
+                freqs.forEach(f => nodes.push(playNote(ctx, f, cursor, dur, 'synth', musicBus, 0.15)));
+                nodes.push(playNote(ctx, freqs[0]/2, cursor, dur, 'bass', musicBus, 0.4));
+                nodes.push(playKick(ctx, cursor, 0.9, masterCompressor, musicBus));
+                nodes.push(playSnare(ctx, cursor + (dur/2), 0.7, masterCompressor, nBuffer));
+                for(let i=0; i<4; i++) nodes.push(playHiHat(ctx, cursor + (dur/4)*i, 0.3, masterCompressor, nBuffer));
             }
-            
-            // Bass: Driving
-            for(let i=0; i<8; i++) playNote(ctx, rootFreq, currentTime + (beatDuration/2)*i, beatDuration/2, bassConfig, musicBus, 0, 0.5 * volMult);
-
-        } else if (genre === 'rnb') {
-            playKick(ctx, currentTime, 1.0, masterBus);
-            playSnare(ctx, currentTime + beatDuration, 0.8, masterBus);
-            playKick(ctx, currentTime + beatDuration * 2.5, 0.9, masterBus);
-            
-            // Bass: Long Sustain
-            playNote(ctx, rootFreq, currentTime, beatDuration * 2, bassConfig, musicBus, 0, 0.6 * volMult);
-            playNote(ctx, rootFreq, currentTime + beatDuration * 2.5, beatDuration * 1.5, bassConfig, musicBus, 0, 0.6 * volMult);
-            
-            // Hats
-            for(let i=0; i<8; i++) playHiHat(ctx, currentTime + (beatDuration/2)*i, 0.2 * volMult, masterBus);
-
-        } else if (genre === 'country') {
-            playKick(ctx, currentTime, 0.9, masterBus);
-            playSnare(ctx, currentTime + beatDuration, 0.8 * volMult, masterBus);
-            playKick(ctx, currentTime + beatDuration * 2, 0.9, masterBus);
-            playSnare(ctx, currentTime + beatDuration * 3, 0.8 * volMult, masterBus);
-            
-            // Bass: Root-Five
-            playNote(ctx, rootFreq, currentTime, beatDuration, bassConfig, musicBus, 0, 0.5 * volMult);
-            playNote(ctx, rootFreq * 1.5, currentTime + beatDuration*2, beatDuration, bassConfig, musicBus, 0, 0.5 * volMult);
-        } else if (genre === 'chinese') {
-            if (isChorus) playKick(ctx, currentTime, 0.8, masterBus); // Soft kick in chorus
-            if (Math.random() > 0.6) playWoodblock(ctx, currentTime + beatDuration * (Math.random()*4), masterBus);
-             // Drone Bass
-            playNote(ctx, rootFreq, currentTime, barDuration, bassConfig, musicBus, 0, 0.3);
-        }
-
-        // --- HARMONY ---
-        
-        // 1. Chords (Pulsing or Sustained)
-        frequencies.forEach((f, i) => {
-            const pan = (i % 2 === 0) ? -0.3 : 0.3;
-            // Main Chords
-            playNote(ctx, f, currentTime, barDuration, instConfig, musicBus, pan, 0.2 * volMult);
-            
-            // 2. Pad (Always active for atmosphere, huge reverb)
-            playNote(ctx, f, currentTime, barDuration, padConfig, reverb, pan * 0.5, 0.1 * volMult);
+            cursor += dur;
         });
+    });
+  });
 
-        // 3. Arpeggiator (Pop Chorus only)
-        if (genre === 'pop' && isChorus) {
-            for(let i=0; i<16; i++) {
-                const noteIndex = i % frequencies.length;
-                const noteTime = currentTime + (beatDuration/4) * i;
-                // Pluck sound
-                playNote(ctx, frequencies[noteIndex] * 2, noteTime, 0.1, leadConfig, musicBus, (i%2===0? -0.4:0.4), 0.15);
-            }
-        }
-
-        // 4. Country Strumming
-        if (genre === 'country') {
-             // Already handled by basic chord logic usually, but let's add specific strum
-             frequencies.forEach((f, i) => playNote(ctx, f, currentTime + (i*0.03), barDuration/2, instConfig, musicBus, 0.2, 0.2 * volMult));
-             frequencies.forEach((f, i) => playNote(ctx, f, currentTime + beatDuration*2 + (i*0.03), barDuration/2, instConfig, musicBus, -0.2, 0.2 * volMult));
-        }
-
-        currentTime += barDuration;
-    }
+  return { nodes, duration: cursor - startTime };
 };
 
 export const playSongDemo = async (song: Song, vocalBuffer: AudioBuffer | null) => {
@@ -503,78 +242,74 @@ export const playSongDemo = async (song: Song, vocalBuffer: AudioBuffer | null) 
   const ctx = getAudioContext();
   if (ctx.state === 'suspended') await ctx.resume();
 
-  // Initialize Master Bus
-  const { masterCompressor, reverbNode, musicBus } = setupMasterBus(ctx);
-  if (!masterCompressor || !reverbNode || !musicBus) return { stop: stopAudio, duration: 0 };
+  const { masterCompressor, reverbNode, musicBus } = setupRouting(ctx);
+  const { nodes, duration } = renderMusicToContext(ctx, song, vocalBuffer, musicBus, masterCompressor, reverbNode, ctx.currentTime + 0.2);
+  activeNodes = nodes;
 
-  const startTime = ctx.currentTime + 0.2;
-  let cursor = startTime;
+  return { stop: stopAudio, duration };
+};
 
-  const tempoMatch = song.tempo.match(/(\d+)/);
-  const bpm = tempoMatch ? parseInt(tempoMatch[1]) : 100;
-  const secondsPerBeat = 60 / bpm;
-  const secondsPerBar = secondsPerBeat * 4;
+export const stopAudio = () => {
+  activeNodes.forEach(node => { try { if (node instanceof AudioBufferSourceNode || node instanceof OscillatorNode) node.stop(); node.disconnect(); } catch (e) { } });
+  activeNodes = [];
+};
 
-  // 1. Vocals (Process with Doubling + Reverb + Compression)
-  if (vocalBuffer) {
-    // Lead Vocal (Center)
-    const vocalSource = ctx.createBufferSource();
-    vocalSource.buffer = vocalBuffer;
-    const vocalGain = ctx.createGain();
-    vocalGain.gain.value = 0.9; 
-    vocalSource.connect(vocalGain).connect(masterCompressor); // Go straight to Master Comp, bypass sidechain
-    vocalSource.start(startTime);
+// --- WAV ENCODER HELPER ---
+function audioBufferToWav(buffer: AudioBuffer): Blob {
+  const numOfChan = buffer.numberOfChannels;
+  const length = buffer.length * numOfChan * 2 + 44;
+  const outBuffer = new ArrayBuffer(length);
+  const view = new DataView(outBuffer);
+  const channels = [];
+  let i;
+  let sample;
+  let offset = 0;
+  let pos = 0;
 
-    // Vocal Doubles (Wide) - Send to Reverb
-    const doubleL = ctx.createBufferSource(); doubleL.buffer = vocalBuffer;
-    const doubleR = ctx.createBufferSource(); doubleR.buffer = vocalBuffer;
-    
-    const panL = ctx.createStereoPanner(); panL.pan.value = -0.4;
-    const panR = ctx.createStereoPanner(); panR.pan.value = 0.4;
-    
-    const doubleGain = ctx.createGain(); doubleGain.gain.value = 0.35;
+  function setUint16(data: number) { view.setUint16(pos, data, true); pos += 2; }
+  function setUint32(data: number) { view.setUint32(pos, data, true); pos += 4; }
 
-    doubleL.connect(panL).connect(doubleGain).connect(reverbNode); // Send to reverb
-    doubleR.connect(panR).connect(doubleGain).connect(reverbNode);
+  setUint32(0x46464952); // "RIFF"
+  setUint32(length - 8);
+  setUint32(0x45564157); // "WAVE"
+  setUint32(0x20746d66); // "fmt "
+  setUint32(16);
+  setUint16(1); // PCM 
+  setUint16(numOfChan);
+  setUint32(buffer.sampleRate);
+  setUint32(buffer.sampleRate * 2 * numOfChan);
+  setUint16(numOfChan * 2);
+  setUint16(16);
+  setUint32(0x61746164); // "data"
+  setUint32(length - pos - 4);
 
-    doubleL.start(startTime + 0.02); // 20ms delay
-    doubleR.start(startTime + 0.03); // 30ms delay
-
-    activeNodes.push(vocalSource, vocalGain, doubleL, doubleR, panL, panR, doubleGain);
+  for (i = 0; i < buffer.numberOfChannels; i++) channels.push(buffer.getChannelData(i));
+  while (pos < length) {
+    for (i = 0; i < numOfChan; i++) {
+      sample = Math.max(-1, Math.min(1, channels[i][offset]));
+      sample = (sample < 0 ? sample * 0x8000 : sample * 0x7FFF);
+      view.setInt16(pos, sample, true);
+      pos += 2;
+    }
+    offset++;
   }
+  return new Blob([outBuffer], { type: "audio/wav" });
+}
 
-  // 2. Music Arrangement
-  song.sections.forEach(section => {
-    // If no chords generated (rare), fallback
-    const chords = section.chords.length > 0 ? section.chords : Array(section.lyrics.length).fill("C");
+export const renderSongToBlob = async (song: Song, vocalBuffer: AudioBuffer | null): Promise<Blob> => {
+  const bpm = parseInt(song.tempo) || 90;
+  const barDur = (60/bpm) * 4;
+  let totalChords = 0;
+  song.sections.forEach(s => s.chords.forEach(cl => totalChords += cl.split(/\s+/).filter(x => x.length > 0).length));
+  
+  // Extra tail for reverb
+  const totalDuration = (totalChords * (barDur / 4)) + 5; 
+  const sampleRate = 44100;
+  const offlineCtx = new OfflineAudioContext(2, Math.ceil(sampleRate * totalDuration), sampleRate);
 
-    chords.forEach((chordLine) => {
-        const chordsInLine = chordLine.split(/[\s-]+/).filter(c => c.length > 0);
-        const durationPerChord = secondsPerBar / (chordsInLine.length || 1);
+  const { masterCompressor, reverbNode, musicBus } = setupRouting(offlineCtx);
+  renderMusicToContext(offlineCtx, song, vocalBuffer, musicBus, masterCompressor, reverbNode, 0);
 
-        chordsInLine.forEach(chordName => {
-            const freqs = getChordFrequencies(chordName);
-            if (freqs.length > 0) {
-                playArrangement(
-                    ctx, 
-                    song.genre, 
-                    freqs, 
-                    cursor, 
-                    durationPerChord, 
-                    bpm, 
-                    musicBus, 
-                    masterCompressor, 
-                    reverbNode,
-                    section.type // Pass section type for dynamics
-                );
-            }
-            cursor += durationPerChord;
-        });
-    });
-  });
-
-  return {
-    stop: stopAudio,
-    duration: cursor - startTime
-  };
+  const renderedBuffer = await offlineCtx.startRendering();
+  return audioBufferToWav(renderedBuffer);
 };
